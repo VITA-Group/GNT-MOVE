@@ -4,22 +4,27 @@ import numpy as np
 import shutil
 import torch
 import torch.utils.data.distributed
+import torch.nn.functional as F
 
 from torch.utils.data import DataLoader
 
 from gnt.data_loaders import dataset_dict
 from gnt.render_ray import render_rays
 from gnt.render_image import render_single_image
-from gnt.model import GNTModel
+from gnt.model import GNTModel, GNTMoEModel
 from gnt.sample_ray import RaySamplerSingleImage
 from gnt.criterion import Criterion
-from utils import img2mse, mse2psnr, img_HWC2CHW, colorize, cycle, img2psnr
+from utils import img2mse, mse2psnr, img_HWC2CHW, colorize, cycle, img2psnr,collect_noisy_gating_loss, distance
 import config
 import torch.distributed as dist
 from gnt.projection import Projector
 from gnt.data_loaders.create_training_dataset import create_training_dataset
 import imageio
 
+from torch.utils.tensorboard import SummaryWriter   
+
+import fmoe
+import datetime
 
 def worker_init_fn(worker_id):
     np.random.seed(np.random.get_state()[1][0] + worker_id)
@@ -47,6 +52,8 @@ def train(args):
     print("outputs will be saved to {}".format(out_folder))
     os.makedirs(out_folder, exist_ok=True)
 
+    # resfile = open('distance.txt','w')
+
     # save the args and config files
     f = os.path.join(out_folder, "args.txt")
     with open(f, "w") as file:
@@ -58,6 +65,10 @@ def train(args):
         f = os.path.join(out_folder, "config.txt")
         if not os.path.isfile(f):
             shutil.copy(args.config, f)
+
+    # log file
+    if args.local_rank==0:
+        writer = SummaryWriter(out_folder)
 
     # create training dataset
     train_dataset, train_sampler = create_training_dataset(args)
@@ -80,9 +91,19 @@ def train(args):
     val_loader_iterator = iter(cycle(val_loader))
 
     # Create GNT model
-    model = GNTModel(
-        args, load_opt=not args.no_load_opt, load_scheduler=not args.no_load_scheduler
-    )
+    moe_save_flag = args.arch.endswith('moe') and (not args.moe_data_distributed)
+    if args.arch.endswith('gnt'):
+        model = GNTModel(
+            args, load_opt=not args.no_load_opt, load_scheduler=not args.no_load_scheduler
+        )
+    elif args.arch.endswith('moe'):
+        model = GNTMoEModel(
+            args, load_opt=not args.no_load_opt, load_scheduler=not args.no_load_scheduler
+        )
+    if args.local_rank==0:
+        state = (model.net_coarse).state_dict()
+        for key, item in state.items():
+            print(key, item.shape)
     # create projector
     projector = Projector(device=device)
 
@@ -101,9 +122,9 @@ def train(args):
                 train_sampler.set_epoch(epoch)
 
             # Start of core optimization loop
-
+            
             # load training rays
-            ray_sampler = RaySamplerSingleImage(train_data, device)
+            ray_sampler = RaySamplerSingleImage(train_data, device, consistency=args.consistency)
             N_rand = int(
                 1.0 * args.N_rand * args.num_source_views / train_data["src_rgbs"][0].shape[0]
             )
@@ -113,8 +134,17 @@ def train(args):
                 center_ratio=args.center_ratio,
             )
 
-            featmaps = model.feature_net(ray_batch["src_rgbs"].squeeze(0).permute(0, 3, 1, 2))
-
+            featmaps = model.feature_net(ray_batch["src_rgbs"].squeeze(0).permute(0, 3, 1, 2)) #roughly H/4 W/4, has some paddings
+            
+            target_featmaps = None
+            if args.use_target:
+                target_featmaps = model.feature_net(train_data["rgb"].permute(0, 3, 1, 2).to(device))
+                for i in range(len(target_featmaps)):
+                    temp = target_featmaps[i]
+                    temp = F.interpolate(temp, train_data["rgb"].shape[1])
+                    temp = temp.reshape(-1, target_featmaps[i].shape[1])[ray_batch["selected_inds"]]
+                    target_featmaps[i] = torch.cat([ray_batch["rgb"], temp], dim=-1)
+            
             ret = render_rays(
                 ray_batch=ray_batch,
                 model=model,
@@ -127,11 +157,45 @@ def train(args):
                 white_bkgd=args.white_bkgd,
                 ret_alpha=args.N_importance > 0,
                 single_net=args.single_net,
+                consistency=args.consistency,
+                target_featmaps=target_featmaps,
             )
 
             # compute loss
             model.optimizer.zero_grad()
             loss, scalars_to_log = criterion(ret["outputs_coarse"], ray_batch, scalars_to_log)
+            
+            if args.arch.endswith('gntmoe'):
+                gating_loss = collect_noisy_gating_loss(model, args.moe_noisy_gate_loss_weight)
+                loss += gating_loss
+            if args.consistency:
+                EPSILON = 10e-3
+                Delta = 10e3
+                close_rays = ray_batch["close_inds"]
+                logits = torch.stack(ret["outputs_coarse"]["moe_logits"])
+                logits = logits.view(logits.shape[0], N_rand, -1, 4)
+                pts = ret["outputs_coarse"]["pts"]
+                ids=np.nonzero(close_rays)[0]
+                rays_a = torch.zeros([logits.shape[0], len(ids), logits.shape[2], 4])
+                rays_b = torch.zeros([logits.shape[0], len(ids), logits.shape[2], 4])
+                dist_all = torch.zeros([len(ids), logits.shape[2]])
+                rays_b_s=[]
+                for ii, idx in enumerate(ids):
+                    rays_a[:,ii:ii+1,:,:] = logits[:,idx:idx+1,:,:]
+                    rays_b[:,ii:ii+1,:,:] = logits[:,idx-1:idx,:,:]
+                    dist = distance(pts[idx,:,:], pts[idx-1,:,:])
+                    val, ind = dist.min(dim=-1)
+                    dist_all[ii] = val
+                    rays_b_s.append(rays_b[:,ii:ii+1,ind,:])
+                if len(rays_b_s)>0:
+                    rays_b_sel= torch.stack(rays_b_s, dim=1).squeeze(dim=2)
+                    kl = F.kl_div(rays_a.log(), rays_b_sel, reduction='none')
+                    kl = torch.mean(kl, dim=(0,3), keepdim=True).squeeze()
+                    dist_all[dist_all != dist_all]=Delta
+                    dist_all = torch.clamp(dist_all, min=EPSILON, max=Delta)
+                    weights = F.softmax(-dist_all, dim=1)
+                    consistency_loss = torch.mean(kl*weights).to(device=loss.device)*1e5
+                    loss += consistency_loss
 
             if ret["outputs_fine"] is not None:
                 fine_loss, scalars_to_log = criterion(
@@ -141,6 +205,8 @@ def train(args):
 
             loss.backward()
             scalars_to_log["loss"] = loss.item()
+            if args.arch.endswith('moe'):
+                model.net_coarse.allreduce_params()
             model.optimizer.step()
             model.scheduler.step()
 
@@ -149,70 +215,77 @@ def train(args):
             dt = time.time() - time0
 
             # Rest is logging
-            if args.local_rank == 0:
-                if global_step % args.i_print == 0 or global_step < 10:
-                    # write mse and psnr stats
-                    mse_error = img2mse(ret["outputs_coarse"]["rgb"], ray_batch["rgb"]).item()
-                    scalars_to_log["train/coarse-loss"] = mse_error
-                    scalars_to_log["train/coarse-psnr-training-batch"] = mse2psnr(mse_error)
-                    if ret["outputs_fine"] is not None:
-                        mse_error = img2mse(ret["outputs_fine"]["rgb"], ray_batch["rgb"]).item()
-                        scalars_to_log["train/fine-loss"] = mse_error
-                        scalars_to_log["train/fine-psnr-training-batch"] = mse2psnr(mse_error)
+            rank = args.local_rank
+            if rank == 0 and (global_step % args.i_print == 0 or global_step < 10):
+                # write mse and psnr stats
+                mse_error = img2mse(ret["outputs_coarse"]["rgb"], ray_batch["rgb"]).item()
+                scalars_to_log["coarse-loss"] = mse_error
+                psnr = mse2psnr(mse_error)
+                
+                writer.add_scalar("coarse_loss", mse_error, global_step)
+                writer.add_scalar('gating_loss', gating_loss, global_step)
+                scalars_to_log["gating_loss"] = gating_loss
+                scalars_to_log["coarse-psnr-training-batch"] = psnr
+                writer.add_scalar('loss', loss.item(), global_step)
+                writer.add_scalar('psnr_train', psnr, global_step)
+                if ret["outputs_fine"] is not None:
+                    mse_error = img2mse(ret["outputs_fine"]["rgb"], ray_batch["rgb"]).item()
+                    scalars_to_log["train/fine-loss"] = mse_error
+                    scalars_to_log["train/fine-psnr-training-batch"] = mse2psnr(mse_error)
+            
+                logstr = "{} Epoch: {}  step: {} ".format(args.expname, epoch, global_step)
+                for k in scalars_to_log.keys():
+                    logstr += " {}: {:.6f}".format(k, scalars_to_log[k])
+                print(logstr)
+                print("each iter time {:.05f} seconds".format(dt))
 
-                    logstr = "{} Epoch: {}  step: {} ".format(args.expname, epoch, global_step)
-                    for k in scalars_to_log.keys():
-                        logstr += " {}: {:.6f}".format(k, scalars_to_log[k])
-                    print(logstr)
-                    print("each iter time {:.05f} seconds".format(dt))
+            if global_step % args.i_weights == 0:
+                print("Saving checkpoints at {} to {}...".format(global_step, out_folder))
+                fpath = os.path.join(out_folder, "model_{:06d}.pth".format(global_step))
+                model.save_model(fpath, moe_save_flag)
 
-                if global_step % args.i_weights == 0:
-                    print("Saving checkpoints at {} to {}...".format(global_step, out_folder))
-                    fpath = os.path.join(out_folder, "model_{:06d}.pth".format(global_step))
-                    model.save_model(fpath)
+            if rank == 0 and global_step % args.i_img == 0:
+                print("Logging a random validation view...")
+                val_data = next(val_loader_iterator)
+                tmp_ray_sampler = RaySamplerSingleImage(
+                    val_data, device, render_stride=args.render_stride
+                )
+                H, W = tmp_ray_sampler.H, tmp_ray_sampler.W
+                gt_img = tmp_ray_sampler.rgb.reshape(H, W, 3)
+                log_view(
+                    global_step,
+                    args,
+                    model,
+                    tmp_ray_sampler,
+                    projector,
+                    gt_img,
+                    render_stride=args.render_stride,
+                    prefix="val/",
+                    out_folder=out_folder,
+                    ret_alpha=args.N_importance > 0,
+                    single_net=args.single_net,
+                )
+                torch.cuda.empty_cache()
 
-                if global_step % args.i_img == 0:
-                    print("Logging a random validation view...")
-                    val_data = next(val_loader_iterator)
-                    tmp_ray_sampler = RaySamplerSingleImage(
-                        val_data, device, render_stride=args.render_stride
-                    )
-                    H, W = tmp_ray_sampler.H, tmp_ray_sampler.W
-                    gt_img = tmp_ray_sampler.rgb.reshape(H, W, 3)
-                    log_view(
-                        global_step,
-                        args,
-                        model,
-                        tmp_ray_sampler,
-                        projector,
-                        gt_img,
-                        render_stride=args.render_stride,
-                        prefix="val/",
-                        out_folder=out_folder,
-                        ret_alpha=args.N_importance > 0,
-                        single_net=args.single_net,
-                    )
-                    torch.cuda.empty_cache()
-
-                    print("Logging current training view...")
-                    tmp_ray_train_sampler = RaySamplerSingleImage(
-                        train_data, device, render_stride=1
-                    )
-                    H, W = tmp_ray_train_sampler.H, tmp_ray_train_sampler.W
-                    gt_img = tmp_ray_train_sampler.rgb.reshape(H, W, 3)
-                    log_view(
-                        global_step,
-                        args,
-                        model,
-                        tmp_ray_train_sampler,
-                        projector,
-                        gt_img,
-                        render_stride=1,
-                        prefix="train/",
-                        out_folder=out_folder,
-                        ret_alpha=args.N_importance > 0,
-                        single_net=args.single_net,
-                    )
+                print("Logging current training view...")
+                tmp_ray_train_sampler = RaySamplerSingleImage(
+                    train_data, device, render_stride=1
+                )
+                H, W = tmp_ray_train_sampler.H, tmp_ray_train_sampler.W
+                gt_img = tmp_ray_train_sampler.rgb.reshape(H, W, 3)
+                log_view(
+                    global_step,
+                    args,
+                    model,
+                    tmp_ray_train_sampler,
+                    projector,
+                    gt_img,
+                    render_stride=1,
+                    prefix="train/",
+                    out_folder=out_folder,
+                    ret_alpha=args.N_importance > 0,
+                    single_net=args.single_net,
+                )
             global_step += 1
             if global_step > model.start_step + args.n_iters + 1:
                 break
@@ -237,9 +310,19 @@ def log_view(
     with torch.no_grad():
         ray_batch = ray_sampler.get_all()
         if model.feature_net is not None:
-            featmaps = model.feature_net(ray_batch["src_rgbs"].squeeze(0).permute(0, 3, 1, 2))
+            featmaps = model.feature_net(ray_batch["src_rgbs"].squeeze(0).permute(0, 3, 1, 2)) #roughly H/4 W/4, has some paddings
+            target_featmaps = None
+            if args.use_target:
+                target_img = gt_img[None, :, :, :]
+                target_featmaps = model.feature_net(target_img.permute(0, 3, 1, 2).to(featmaps[0].device))
+                for i in range(len(target_featmaps)):
+                    temp = target_featmaps[i]
+                    temp = F.interpolate(temp, target_img.shape[1])
+                    temp = temp.reshape(-1, target_featmaps[i].shape[1])
+                    target_featmaps[i] = torch.cat([ray_batch["rgb"], temp], dim=-1)
         else:
             featmaps = [None, None]
+            target_featmaps = None
         ret = render_single_image(
             ray_sampler=ray_sampler,
             ray_batch=ray_batch,
@@ -255,6 +338,7 @@ def log_view(
             featmaps=featmaps,
             ret_alpha=ret_alpha,
             single_net=single_net,
+            target_featmaps=target_featmaps,
         )
 
     average_im = ray_sampler.src_rgbs.cpu().mean(dim=(0, 1))
@@ -312,7 +396,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.distributed:
-        torch.distributed.init_process_group(backend="nccl", init_method="env://")
+        torch.distributed.init_process_group(backend="nccl", init_method="env://", timeout=datetime.timedelta(seconds=5400))
         args.local_rank = int(os.environ.get("LOCAL_RANK"))
         torch.cuda.set_device(args.local_rank)
 

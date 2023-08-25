@@ -1,4 +1,4 @@
-# Enhancing NeRF akin to Enhancing LLMs: Generalizable NeRF Transformer with Mixture-of-View-Experts
+# Enhancing NeRF akin to Enhancing LLMs: Generalizable NeRF Transformer with Mixture-of-View-Experts [ArXiv](https://arxiv.org/abs/2308.11793)
 [Wenyan Cong]()<sup>1∗</sup>,
 [Hanxue Liang]()<sup>2,1∗</sup>,
 [Peihao Wang](https://peihaowang.github.io/)<sup>1</sup>,
@@ -11,8 +11,6 @@
 <sup>1</sup>University of Texas at Austin, <sup>2</sup>University of Cambridge, <sup>3</sup>Indian Institute of Technology Madras
 
 <sup>*</sup> denotes equal contribution.
-
-[Paper](https://arxiv.org/abs/2308.11793)
 
 This repository is built based on GNT's [offical repository](https://github.com/VITA-Group/GNT)
 
